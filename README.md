@@ -23,7 +23,7 @@ Almost every memory-budget layer written in the wild is wrong in the same four w
 
 ---
 
-## The design, in seven decisions
+## The design, in nine decisions
 
 **1. Headroom, not ceiling.** `HostBudget` carries `limit`, `baseline` and `safetyMargin` separately. Everything is decided against `headroom`, and the plan reserves the **peak** — steady state plus the transient cost of activation — never the steady state alone.
 
@@ -38,6 +38,10 @@ Almost every memory-budget layer written in the wild is wrong in the same four w
 **6. The activation model is explicit, and it is the dangerous knob.** `.sequential` carries one activation peak; `.concurrent` adds them all. The default is `.sequential` because that is what a `for` loop does. A caller who activates in a `TaskGroup` and leaves the default has told the planner a specific lie — which is why (7) exists.
 
 **7. The model is held to account.** `BudgetAudit` compares every modelled peak against the measured one and gates on the difference, **asymmetrically**: over-prediction wastes headroom and passes; under-prediction manufactures confidence in a plan that gets the process killed, and fails. Counters survive ring-buffer eviction, so a burst of bad samples cannot be erased by pushing good ones through afterwards.
+
+**8. Every constructor validates, including the one the compiler wrote.** `Decodable` on a public type is a second constructor, and a synthesized one assigns straight past your invariants. `{"rawValue": -1}` would hand back a negative `ByteCount`; a remotely-delivered `PressurePolicy` of 400% would revoke four times the headroom; a crafted `HostBudgetTable` would supply its own *generous* fail-closed floor and quietly invert decision 2. Every one of those types decodes through its validating initialiser instead — which matters precisely because remote config is the realistic delivery mechanism for all three.
+
+**9. Nothing in here grows without a bound.** The audit log is a ring. The reservation ledger has a hard count cap, and that is not decoration: a zero-byte reservation always satisfies the ceiling check, and zero-byte deltas are the *normal* case once components are resident, so a caller that admits per timeline refresh and forgets to `complete` would otherwise grow a dictionary forever — an unbounded collection inside a memory-budget library.
 
 ### The reentrancy decision worth reading the code for
 
@@ -65,7 +69,7 @@ The obvious shape is an actor. An actor would be wrong, because callers must `aw
 | `ReservationLedger` | Check-and-reserve with no suspension point in between. |
 | `ResidencyCoordinator` | The actor that composes measure → plan → reserve → apply → audit. |
 | `BudgetAudit` | Bounded, asymmetric model-vs-reality gate. |
-| `FootprintProbe` / `MachFootprintProbe` | Injectable measurement; the real one reads `phys_footprint` (not `resident_size`, which under-reports compressed pages). |
+| `FootprintProbe` / `MachFootprintProbe` | Injectable measurement; the real one reads `phys_footprint` (not `resident_size`, which under-reports compressed pages) and returns `.max` when the kernel call fails, so a broken probe refuses work instead of reporting an empty process. |
 | `ExampleCatalog` | A worked seven-component core sized so every interesting case is reachable. |
 
 ---
@@ -76,23 +80,28 @@ The obvious shape is an actor. An actor would be wrong, because callers must `aw
 import HostMemoryResidency
 
 let planner = ResidencyPlanner(budgets: .illustrative)
-let plan = try planner.plan(
-    host: HostClass(kind: .widgetExtension, tier: .constrained),
-    purpose: .timelineRefresh,
-    catalog: ExampleCatalog.make()
-)
-
-print(plan.reservedPeakBytes)          // fits inside 17 MB of headroom
-print(plan.degradations)               // the content index, below its meaning floor — declared
-print(plan.retained)                   // anything too expensive to let go of
+do {
+    let plan = try planner.plan(
+        host: HostClass(kind: .widgetExtension, tier: .constrained),
+        purpose: .timelineRefresh,
+        catalog: ExampleCatalog.make()
+    )
+    print(plan.headroomBytes)      // 17.0 MB
+    print(plan.steadyStateBytes)   // 6.5 MB — three components survive, four do not
+    print(plan.degradations)       // the content index, below its meaning floor, recorded
+} catch {
+    print(error)                   // refusal is a designed outcome, not an exception
+}
 ```
+
+Pass a `resident:` set to see the eviction and retention paths — a cold process has nothing to give up, so those lists are empty until something is already in memory.
 
 Swap `.constrained` for `.generous`, or `.widgetExtension` for `.application`, and watch the same catalog resolve differently. That is the whole point: the code did not change, the process did.
 
 ### Installation
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/host-memory-residency-kit.git", from: "1.0.0")
+.package(url: "https://github.com/rajatslakhina/host-memory-residency-kit.git", from: "2.0.0")
 ```
 
 ---
@@ -103,16 +112,17 @@ Swap `.constrained` for `.generous`, or `.widgetExtension` for `.application`, a
 - **Reduction order.** Meaning-preserving reductions everywhere → drop optional components → step below meaning floors. The rejected alternative — drop optional components first, since they are explicitly expendable — reaches a fitting plan in fewer steps but throws away a whole feature while something else sits at `full` because nobody looked at it. Losing a feature should cost more than losing resolution.
 - **Greedy, not optimal.** The ladder reduces the largest component first. It is not a knapsack solver and does not claim to find the minimum-loss plan; it claims to find a fitting plan deterministically and cheaply, in a code path that runs inside a memory-pressure handler.
 - **`retained` bytes are pessimistic.** A retained component might be evictable later under different conditions. Modelling that would require a time dimension the planner does not have, so it charges for them now.
+- **The teardown bound is conservative.** It charges the largest teardown buffer among *every* net-positive resident component, not only the ones the plan finally drops, because which components get dropped is not known until the ladder settles. The cost is refusing a few plans that would in fact have fitted; the alternative under-charges the peak, and under-charging is the one direction this library treats as unacceptable.
 - **`.illustrative` numbers are invented.** They are shaped like real iOS limits; they are not Apple's, because Apple does not publish Apple's.
 
 ---
 
 ## Verification
 
-- `swift build -Xswiftc -warnings-as-errors` and `swift build --build-tests -Xswiftc -warnings-as-errors` — clean, from a wiped `.build`.
-- `swift test` — **72 tests, 0 failures.**
+- `swift build -Xswiftc -warnings-as-errors` and `swift build --build-tests -Xswiftc -warnings-as-errors` — clean, from a wiped `.build`, in Swift 6 language mode.
+- `swift test` — **85 tests, 0 failures.**
 - CI runs both on Linux (Swift 6 container) and on `macos-15`, where the Darwin `phys_footprint` probe and the SwiftUI module are compiled too. See the [Actions tab](https://github.com/rajatslakhina/host-memory-residency-kit/actions).
-- Every test that guards a claim in this README has a control that fails without the rule — the net-negative eviction test has a twin that changes only the teardown cost and succeeds; the audit gate is fed a deliberately under-predicting model and asserted to **fail**; the reentrancy suite ships the buggy implementation alongside the correct one and asserts the buggy one over-commits.
+- The tests that guard this README's headline claims each ship a control: the net-negative eviction test has a twin that changes only the teardown cost and succeeds; the audit gate is fed a deliberately under-predicting model and asserted to **fail**; the reentrancy suite ships the buggy check-then-act implementation alongside the correct one, drives both through a barrier probe so the interleaving is deterministic, and asserts the buggy one over-commits; the decode tests take a valid payload and break exactly one invariant, so they cannot pass on malformed JSON.
 
 **Demo app:** [host-memory-residency-kit-demo-app](https://github.com/rajatslakhina/host-memory-residency-kit-demo-app) — a SwiftUI app that consumes this package as a version-pinned remote dependency. See that repo for exactly what was and was not run on a Simulator.
 
