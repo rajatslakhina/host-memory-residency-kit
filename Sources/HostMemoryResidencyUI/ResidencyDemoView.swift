@@ -13,10 +13,16 @@ import HostMemoryResidency
 @Observable
 public final class ResidencyDemoModel {
 
-    public var hostKind: HostKind = .widgetExtension
-    public var tier: DeviceMemoryTier = .standard
+    public var hostKind: HostKind
+    public var tier: DeviceMemoryTier
     public var pressure: MemoryPressureLevel = .normal
     public var activationModel: ActivationModel = .sequential
+
+    /// When on, the planner is given a set of already-resident components —
+    /// including one whose teardown costs more than it frees. That is the only
+    /// way the eviction and retention paths can produce anything to look at: a
+    /// cold process has nothing to evict.
+    public var simulateWarmProcess: Bool = false
 
     public private(set) var measuredFootprint: ByteCount = .zero
     public private(set) var concurrencyResult: ConcurrencyResult?
@@ -26,7 +32,35 @@ public final class ResidencyDemoModel {
     private let catalog = ExampleCatalog.make()
     private let planner = ResidencyPlanner(budgets: .illustrative)
 
-    public init() {}
+    /// The host the app detected. The library never guesses this — only the
+    /// process knows what hardware it woke up on.
+    public init(hostKind: HostKind = .widgetExtension, tier: DeviceMemoryTier = .standard) {
+        self.hostKind = hostKind
+        self.tier = tier
+    }
+
+    /// A plausible warm process: the app has been running, the journal and the
+    /// decode cache are already up. The journal's teardown buffer is larger
+    /// than the journal, so it cannot be evicted at a profit.
+    private var residentSet: [ResidentComponent] {
+        guard simulateWarmProcess else { return [] }
+        return [
+            ResidentComponent(
+                id: ExampleCatalog.ID.syncJournal,
+                fidelity: .full,
+                residentBytes: ByteCount(kilobytes: 18_432),
+                teardownPeakBytes: ByteCount(kilobytes: 20_480),
+                rebuildCost: 9
+            ),
+            ResidentComponent(
+                id: ExampleCatalog.ID.imageDecodeCache,
+                fidelity: .reduced,
+                residentBytes: ByteCount(kilobytes: 24_576),
+                teardownPeakBytes: ByteCount(kilobytes: 512),
+                rebuildCost: 2
+            ),
+        ]
+    }
 
     public var host: HostClass { HostClass(kind: hostKind, tier: tier) }
 
@@ -40,6 +74,7 @@ public final class ResidencyDemoModel {
                 host: host,
                 purpose: hostKind.defaultPurpose,
                 catalog: catalog,
+                resident: residentSet,
                 activationModel: activationModel,
                 pressure: pressure
             )
@@ -61,6 +96,19 @@ public final class ResidencyDemoModel {
 
     public var auditVerdict: AuditVerdict {
         audit.verdict(tolerancePercent: 5)
+    }
+
+    /// Candidates for this purpose that the plan chose not to hold at all.
+    ///
+    /// Surfaced because the single most consequential decision on a widget is
+    /// invisible otherwise: the 96 MB image cache is simply *gone*, and a list
+    /// of what survived does not say so.
+    public var droppedComponents: [ComponentID] {
+        guard let plan else { return [] }
+        let kept = Set(plan.selections.map(\.id))
+        return catalog.components(for: hostKind.defaultPurpose)
+            .map(\.id)
+            .filter { !kept.contains($0) }
     }
 
     /// Reads this process's real footprint. Informational only: the plan is
@@ -115,14 +163,21 @@ public final class ResidencyDemoModel {
             catalog: catalog,
             probe: MutableFootprintProbe(.zero)
         )
+        // The coordinator starts at `.normal`; bring it to the picker's level so
+        // the counterfactual below is computed from the same plan that actually
+        // ran rather than a different one.
+        _ = await coordinator.apply(pressure: pressure)
         let host = self.host
+        let model = activationModel
         let attempts = 6
         let singlePeak = plan?.reservedPeakBytes ?? .zero
 
         let outcomes = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
             for _ in 0..<attempts {
                 group.addTask {
-                    if case .success = await coordinator.admit(host: host) { return true }
+                    if case .success = await coordinator.admit(host: host, activationModel: model) {
+                        return true
+                    }
                     return false
                 }
             }
@@ -144,9 +199,14 @@ public final class ResidencyDemoModel {
 /// The demo screen.
 public struct ResidencyDemoView: View {
 
-    @State private var model = ResidencyDemoModel()
+    @State private var model: ResidencyDemoModel
 
-    public init() {}
+    /// The host defaults to a widget extension because that is where the
+    /// interesting answer lives, but an embedding app can pass the class it
+    /// actually detected.
+    public init(hostKind: HostKind = .widgetExtension, tier: DeviceMemoryTier = .standard) {
+        _model = State(wrappedValue: ResidencyDemoModel(hostKind: hostKind, tier: tier))
+    }
 
     public var body: some View {
         NavigationStack {
@@ -155,6 +215,7 @@ public struct ResidencyDemoView: View {
                 budgetSection
                 refusalSection
                 planSection
+                droppedSection
                 degradationSection
                 retainedSection
                 auditSection
@@ -195,6 +256,7 @@ public struct ResidencyDemoView: View {
                 }
             }
             .pickerStyle(.segmented)
+            Toggle("Warm process (something already resident)", isOn: $model.simulateWarmProcess)
         } header: {
             Text("Where is the shared core running?")
         } footer: {
@@ -248,6 +310,27 @@ public struct ResidencyDemoView: View {
                 Text("Resident plan — \(plan.purpose.rawValue)")
             } footer: {
                 Text("\(plan.selections.count) resident · \(plan.evictions.count) evicted · \(plan.retained.count) retained")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var droppedSection: some View {
+        if !model.droppedComponents.isEmpty {
+            Section {
+                ForEach(model.droppedComponents, id: \.self) { id in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(id.rawValue)
+                            .font(.subheadline.weight(.semibold))
+                        Text(ExampleCatalog.rationale(for: id))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Label("Not held at all", systemImage: "minus.circle")
+            } footer: {
+                Text("Candidates for this purpose that the plan declined to hold. On a widget this is where the 96 MB image cache goes — the largest single decision on the screen, and invisible if you only list what survived.")
             }
         }
     }
@@ -307,6 +390,11 @@ public struct ResidencyDemoView: View {
             }
             Button("Reset audit", role: .destructive) {
                 model.resetAudit()
+            }
+            if model.plan == nil {
+                Text("No plan to audit — the current configuration was refused.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         } header: {
             Text("Model-vs-reality gate")
