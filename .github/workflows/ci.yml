@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    # The core module imports Foundation only, so the entire decision layer is
+    # verifiable here. `-warnings-as-errors` makes the "zero warnings" claim in
+    # the README machine-enforced rather than asserted in prose.
+    name: Linux · Swift 6 · warnings-as-errors
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build -Xswiftc -warnings-as-errors
+      - name: Build tests
+        run: swift build --build-tests -Xswiftc -warnings-as-errors
+      - name: Test
+        run: swift test
+
+  apple:
+    # Compiles the Darwin-only paths the Linux job cannot see: the Mach
+    # phys_footprint probe and the SwiftUI demo module.
+    name: macOS · Darwin probe + SwiftUI module
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build -Xswiftc -warnings-as-errors
+      - name: Test
+        run: swift test
