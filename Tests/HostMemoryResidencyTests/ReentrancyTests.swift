@@ -177,20 +177,24 @@ final class ReentrancyTests: XCTestCase {
             return count
         }
 
-        let budget = try XCTUnwrap(planner.budgets.budget(for: host))
-        let ceiling = budget.limit - budget.safetyMargin
+        // The exact figure a single cold admission would reserve. Asserting
+        // against this rather than against some loose upper bound is the point:
+        // if `admit` reserved the full peak per caller instead of the delta, the
+        // ledger would hold a multiple of it and this would fail. A bound like
+        // "less than 6x" would not — the ledger's own ceiling check stops the
+        // stacking bug well before 6x, so a loose assertion passes against it.
+        let coldPlan = try planner.plan(
+            host: host,
+            purpose: host.kind.defaultPurpose,
+            catalog: catalog
+        )
         let reserved = await coordinator.outstandingReservationBytes
-        let measured = await coordinator.measuredBaseline
 
-        XCTAssertLessThanOrEqual(
-            measured + reserved, ceiling,
-            "measured baseline plus every live reservation must stay inside the ceiling"
+        XCTAssertEqual(
+            reserved, coldPlan.reservedPeakBytes,
+            "six callers must reserve the peak once between them, not once each"
         )
-        XCTAssertLessThan(
-            reserved, ByteCount(megabytes: 9) * callers,
-            "reservations must not stack once the components are already resident"
-        )
-        XCTAssertGreaterThanOrEqual(refusals, 0)
+        XCTAssertEqual(refusals, 0, "all six fit; the second onwards cost nothing extra")
     }
 }
 
@@ -316,11 +320,121 @@ final class ResidencyCoordinatorTests: XCTestCase {
         if case .sacrificed(let lost) = outcome {
             XCTAssertEqual(lost, [ComponentID("cache")])
         } else {
-            XCTAssertFalse(
+            // The whole point of the outcome type is that a loss is *reported*.
+            // If pressure returned `.absorbed`, the optional component must
+            // still be resident — a silent eviction is the bug.
+            XCTAssertTrue(
                 after.contains(ComponentID("cache")),
-                "if nothing was reported as sacrificed, nothing may have quietly disappeared: \(outcome)"
+                "nothing was reported as sacrificed, so nothing may have quietly disappeared: \(outcome)"
             )
         }
+    }
+
+    /// `apply(_:)` writes fidelity and byte costs into the resident set. Without
+    /// this, recording every component at the wrong tier passes the whole suite.
+    func testAdmissionRecordsTheExactFidelityAndCostsItPlanned() async throws {
+        let coordinator = makeCoordinator()
+        let host = HostClass(kind: .widgetExtension, tier: .standard)
+
+        guard case .success(let admitted) = await coordinator.admit(host: host) else {
+            return XCTFail("expected an admission")
+        }
+        let resident = await coordinator.residentComponents
+        let byID = Dictionary(resident.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+
+        XCTAssertEqual(resident.count, admitted.plan.selections.count)
+        for selection in admitted.plan.selections {
+            let recorded = try XCTUnwrap(byID[selection.id], "\(selection.id) missing from residency")
+            XCTAssertEqual(recorded.fidelity, selection.fidelity, "\(selection.id) fidelity")
+            XCTAssertEqual(recorded.residentBytes, selection.residentBytes, "\(selection.id) bytes")
+        }
+        let tracked = await coordinator.trackedResidentBytes
+        XCTAssertEqual(tracked, admitted.plan.steadyStateBytes)
+    }
+
+    /// A superseded plan must not roll residency back out from under the plan
+    /// that replaced it.
+    func testAbandoningASupersededPlanDoesNotDeleteTheLivePlansComponents() async throws {
+        let coordinator = makeCoordinator()
+        let host = HostClass(kind: .widgetExtension, tier: .standard)
+
+        guard case .success(let first) = await coordinator.admit(host: host),
+              case .success(let second) = await coordinator.admit(host: host) else {
+            return XCTFail("expected two admissions")
+        }
+
+        let rolledBack = await coordinator.abandon(first)
+        let resident = await coordinator.residentComponents
+        let stillReserved = await coordinator.outstandingReservationBytes
+
+        XCTAssertFalse(rolledBack, "the first plan is stale; it must report that it undid nothing")
+        XCTAssertEqual(
+            Set(resident.map(\.id)),
+            Set(second.plan.selections.map(\.id)),
+            "the live plan's components must survive"
+        )
+        XCTAssertEqual(stillReserved, .zero, "the stale reservation is released either way")
+    }
+
+    /// The control for the test above: a plan that has *not* been superseded
+    /// does roll its own components back out.
+    func testAbandoningTheLivePlanRollsItsComponentsBack() async throws {
+        let coordinator = makeCoordinator()
+        let host = HostClass(kind: .widgetExtension, tier: .standard)
+
+        guard case .success(let only) = await coordinator.admit(host: host) else {
+            return XCTFail("expected an admission")
+        }
+        let populated = await coordinator.residentComponents
+        XCTAssertFalse(populated.isEmpty)
+
+        let rolledBack = await coordinator.abandon(only)
+        let remaining = await coordinator.residentComponents
+        let reserved = await coordinator.outstandingReservationBytes
+
+        XCTAssertTrue(rolledBack)
+        XCTAssertTrue(remaining.isEmpty)
+        XCTAssertEqual(reserved, .zero)
+    }
+
+    /// `reset` revokes reservations; a later `complete` must not file a sample
+    /// for work that was cancelled.
+    func testCompletingACancelledAdmissionRecordsNothing() async throws {
+        let coordinator = makeCoordinator()
+        let host = HostClass(kind: .widgetExtension, tier: .standard)
+        guard case .success(let admitted) = await coordinator.admit(host: host) else {
+            return XCTFail("expected an admission")
+        }
+
+        await coordinator.reset()
+        let recorded = await coordinator.complete(admitted, observedPeak: ByteCount(megabytes: 999))
+        let verdict = await coordinator.auditVerdict()
+
+        XCTAssertFalse(recorded)
+        if case .insufficientData = verdict {
+            // expected: no sample was filed
+        } else {
+            XCTFail("a cancelled admission must not reach the audit: \(verdict)")
+        }
+    }
+
+    /// Zero-byte reservations always satisfy the ceiling check, so the only
+    /// thing standing between a re-admitting widget and an unbounded dictionary
+    /// is the cap.
+    func testTheLedgerRefusesOnceItsReservationCapIsReached() async {
+        let coordinator = ResidencyCoordinator(
+            planner: ResidencyPlanner(budgets: .illustrative),
+            catalog: ExampleCatalog.make(),
+            probe: MutableFootprintProbe(.zero),
+            maximumOutstandingReservations: 3
+        )
+        let host = HostClass(kind: .widgetExtension, tier: .standard)
+
+        var admitted = 0
+        for _ in 0..<10 {
+            if case .success = await coordinator.admit(host: host) { admitted += 1 }
+        }
+        XCTAssertEqual(admitted, 3, "the cap, not the ceiling, is what stops this")
     }
 
     func testResetClearsResidencyReservationsAndAudit() async throws {

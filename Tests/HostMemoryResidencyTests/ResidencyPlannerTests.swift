@@ -392,10 +392,73 @@ final class ResidencyPlannerTests: XCTestCase {
             purpose: .timelineRefresh,
             catalog: catalog
         )
-        XCTAssertLessThanOrEqual(widget.reservedPeakBytes, widget.headroomBytes)
+        // Exact figures rather than "fits", which the planner guarantees by
+        // construction — a plan that did not fit would have been refused, so
+        // asserting that it fits asserts nothing.
+        XCTAssertEqual(widget.headroomBytes, ByteCount(megabytes: 17))
+        XCTAssertEqual(widget.steadyStateBytes, ByteCount(kilobytes: 6_656))
+        XCTAssertEqual(widget.selections.count, 3)
+        XCTAssertEqual(widget.degradations.map(\.component), [ExampleCatalog.ID.contentIndex])
         XCTAssertLessThan(
             widget.steadyStateBytes, app.steadyStateBytes,
             "the same catalog must cost less inside a widget than inside the app"
+        )
+    }
+
+    /// A resident component that the ladder drops to `.absent` is torn down, so
+    /// its teardown buffer belongs in the reserved peak. Charging only the
+    /// activation phase under-predicts — the one direction this library treats
+    /// as unacceptable.
+    func testTeardownOfADroppedCandidateIsChargedToTheReservedPeak() throws {
+        let planner = ResidencyPlanner(budgets: Fixture.budgets(headroomMB: 60))
+        let catalog = try Fixture.catalog([
+            Fixture.declaration("cache", .optional, floor: .full, [
+                Fixture.profile(.full, residentMB: 40, teardownMB: 12)
+            ]),
+            Fixture.declaration("core", .required, floor: .full, [
+                Fixture.profile(.full, residentMB: 30)
+            ]),
+        ])
+        // 40 + 30 = 70 > 60, so `cache` is dropped and torn down.
+        let resident = [Fixture.resident("cache", residentMB: 40, teardownMB: 12)]
+
+        let plan = try planner.plan(
+            host: Fixture.host,
+            purpose: .fullExperience,
+            catalog: catalog,
+            resident: resident
+        )
+
+        XCTAssertEqual(plan.evictions.map(\.id), [ComponentID("cache")])
+        XCTAssertEqual(plan.steadyStateBytes, ByteCount(megabytes: 30))
+        XCTAssertEqual(
+            plan.reservedPeakBytes, ByteCount(megabytes: 52),
+            "40 MB still resident + 12 MB flush buffer, which is worse than the 30 MB settled state"
+        )
+    }
+
+    /// Evictions come back ordered by bytes reclaimed per unit of rebuild cost,
+    /// not by id — so a caller that has to stop early has banked the best wins.
+    func testEvictionsAreOrderedByBenefitNotAlphabetically() throws {
+        let planner = ResidencyPlanner(budgets: Fixture.budgets(headroomMB: 200))
+        let catalog = try Fixture.catalog([])
+        let resident = [
+            // Alphabetically first, but 10 MB net for 10 units of rebuild.
+            Fixture.resident("aaa-cheap-bytes", residentMB: 12, teardownMB: 2, rebuildCost: 10),
+            // Alphabetically last, and 40 MB net for 1 unit of rebuild.
+            Fixture.resident("zzz-best-value", residentMB: 44, teardownMB: 4, rebuildCost: 1),
+        ]
+
+        let plan = try planner.plan(
+            host: Fixture.host,
+            purpose: .fullExperience,
+            catalog: catalog,
+            resident: resident
+        )
+
+        XCTAssertEqual(
+            plan.evictions.map(\.id),
+            [ComponentID("zzz-best-value"), ComponentID("aaa-cheap-bytes")]
         )
     }
 

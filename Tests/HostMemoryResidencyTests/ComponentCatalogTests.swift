@@ -93,6 +93,86 @@ final class ComponentCatalogTests: XCTestCase {
         XCTAssertNil(component.nextLowerFidelity(below: .minimal))
     }
 
+    /// The ladder's exit condition tests the *peak*, so a lower tier whose
+    /// activation ceiling is not also lower could make a step down raise it.
+    func testNonMonotonicActivationCeilingIsRejected() {
+        let declarations = [
+            Fixture.declaration("a", .degradable, floor: .reduced, [
+                FidelityProfile(
+                    fidelity: .full,
+                    residentBytes: ByteCount(megabytes: 10),
+                    activationPeakBytes: ByteCount(megabytes: 1)
+                ),
+                FidelityProfile(
+                    fidelity: .reduced,
+                    residentBytes: ByteCount(megabytes: 8),
+                    activationPeakBytes: ByteCount(megabytes: 40)
+                ),
+            ])
+        ]
+        XCTAssertThrowsError(try Fixture.catalog(declarations)) { error in
+            XCTAssertEqual(
+                error as? CatalogError,
+                .nonMonotonicCost(ComponentID("a"), lower: .reduced, higher: .full)
+            )
+        }
+    }
+
+    /// `Decodable` on a public type is a second constructor. It must enforce the
+    /// same invariants, or every "by construction" claim downstream is false.
+    func testDecodingAComponentDescriptorEnforcesTheSameInvariants() throws {
+        let valid = try XCTUnwrap(ExampleCatalog.make()[ExampleCatalog.ID.contentIndex])
+
+        // Take a genuinely valid payload and break exactly one invariant, so the
+        // test cannot pass merely because the JSON was malformed.
+        var raw = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: JSONEncoder().encode(valid)) as? [String: Any]
+        )
+        raw["profiles"] = [Any]()
+        let gutted = try JSONSerialization.data(withJSONObject: raw)
+
+        XCTAssertThrowsError(try JSONDecoder().decode(ComponentDescriptor.self, from: gutted)) { error in
+            XCTAssertEqual(
+                error as? CatalogError,
+                .componentHasNoProfiles(ExampleCatalog.ID.contentIndex)
+            )
+        }
+
+        let round = try JSONDecoder().decode(
+            ComponentDescriptor.self,
+            from: JSONEncoder().encode(valid)
+        )
+        XCTAssertEqual(round, valid)
+    }
+
+    func testDecodingAPressurePolicyClampsOutOfRangeValues() throws {
+        let policy = try JSONDecoder().decode(
+            PressurePolicy.self,
+            from: Data(#"{"warningRevocationPercent":400,"criticalRevocationPercent":-20}"#.utf8)
+        )
+        XCTAssertEqual(policy.warningRevocationPercent, 100)
+        XCTAssertEqual(policy.criticalRevocationPercent, 0)
+    }
+
+    /// The fail-closed floor is a stored property, so synthesized decoding would
+    /// let a crafted payload supply a generous one.
+    func testDecodingABudgetTableRecomputesTheFailClosedFloor() throws {
+        let table = HostBudgetTable(entries: [
+            HostClass(kind: .application, tier: .generous): HostBudget(
+                limit: ByteCount(megabytes: 4_000), baseline: .zero, safetyMargin: .zero
+            ),
+            HostClass(kind: .widgetExtension, tier: .constrained): HostBudget(
+                limit: ByteCount(megabytes: 30), baseline: .zero, safetyMargin: .zero
+            ),
+        ])
+        let round = try JSONDecoder().decode(
+            HostBudgetTable.self,
+            from: JSONEncoder().encode(table)
+        )
+        let unlisted = HostClass(kind: .shareExtension, tier: .generous)
+        XCTAssertEqual(round.budget(for: unlisted)?.limit, ByteCount(megabytes: 30))
+    }
+
     func testEmptyCatalogIsValidAndSelectsNothing() throws {
         let catalog = try Fixture.catalog([])
         XCTAssertTrue(catalog.isEmpty)

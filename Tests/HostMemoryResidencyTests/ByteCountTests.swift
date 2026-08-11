@@ -70,9 +70,25 @@ final class ByteCountTests: XCTestCase {
     }
 
     func testPercentSaturatesRatherThanOverflowing() {
-        // rawValue * 100 overflows for anything above Int.max / 100.
-        let verdict = ByteCount.max.percent(of: ByteCount(bytes: 1))
-        XCTAssertGreaterThan(verdict, 0, "saturating multiply must keep the sign sane")
+        // rawValue * 100 overflows for anything above Int.max / 100, so the
+        // multiply saturates to Int.max and the division by 1 leaves it there.
+        XCTAssertEqual(ByteCount.max.percent(of: ByteCount(bytes: 1)), Int.max)
+        // A case where saturation must NOT kick in, so the assertion above is
+        // not just reporting that everything saturates.
+        XCTAssertEqual(ByteCount(bytes: 3).percent(of: ByteCount(bytes: 4)), 75)
+    }
+
+    func testDecodingRoutesThroughTheClampingInitialiser() throws {
+        // Synthesized Decodable would assign rawValue directly and hand back a
+        // negative ByteCount, falsifying the type's central invariant.
+        let decoded = try JSONDecoder().decode(ByteCount.self, from: Data("-4096".utf8))
+        XCTAssertEqual(decoded, .zero)
+
+        let round = try JSONDecoder().decode(
+            ByteCount.self,
+            from: JSONEncoder().encode(ByteCount(megabytes: 7))
+        )
+        XCTAssertEqual(round, ByteCount(megabytes: 7))
     }
 
     func testSumOverEmptySequenceIsZero() {

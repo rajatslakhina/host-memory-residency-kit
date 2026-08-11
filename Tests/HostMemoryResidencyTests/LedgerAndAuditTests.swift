@@ -173,6 +173,17 @@ final class BudgetAuditTests: XCTestCase {
         XCTAssertFalse(audit.verdict().isPass)
     }
 
+    func testTheReservationCapIsEnforced() {
+        var ledger = ReservationLedger(maximumOutstandingReservations: 2)
+        let ceiling = ByteCount(megabytes: 100)
+        // Zero-byte reservations always satisfy the ceiling check, which is why
+        // the count cap has to exist independently of it.
+        XCTAssertNotNil(ledger.reserve(peak: .zero, ceiling: ceiling))
+        XCTAssertNotNil(ledger.reserve(peak: .zero, ceiling: ceiling))
+        XCTAssertNil(ledger.reserve(peak: .zero, ceiling: ceiling))
+        XCTAssertEqual(ledger.reservationCount, 2)
+    }
+
     func testUnderPredictionPercentDoesNotDivideByZero() {
         let zeroReserved = AuditSample(
             host: Fixture.host,
@@ -182,7 +193,20 @@ final class BudgetAuditTests: XCTestCase {
             observedPeak: ByteCount(megabytes: 1)
         )
         XCTAssertTrue(zeroReserved.underPredicted)
-        XCTAssertEqual(zeroReserved.underPredictionPercent, Int.max)
+        // Clamped rather than Int.max: one such sample would otherwise pin the
+        // gate at 9223372036854775807% forever — still failing, but unreadable.
+        XCTAssertEqual(
+            zeroReserved.underPredictionPercent,
+            AuditSample.maximumReportedUnderPredictionPercent
+        )
+
+        var audit = BudgetAudit(capacity: 4)
+        audit.record(zeroReserved)
+        XCTAssertEqual(
+            audit.worstUnderPredictionPercent,
+            AuditSample.maximumReportedUnderPredictionPercent
+        )
+        XCTAssertFalse(audit.verdict(tolerancePercent: 50).isPass)
     }
 
     func testResetClearsEverything() {
