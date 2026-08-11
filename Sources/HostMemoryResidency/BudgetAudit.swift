@@ -32,11 +32,20 @@ public struct AuditSample: Sendable, Hashable {
         underPredicted ? observedPeak - reservedPeak : reservedPeak - observedPeak
     }
 
-    /// Under-prediction as a percentage of what was reserved. Zero when the
-    /// model over-predicted.
+    /// Ceiling on the reported error.
+    ///
+    /// A plan reserving zero bytes divides into `Int.max`, and one such sample
+    /// would pin `worstUnderPredictionPercent` at 9223372036854775807% forever —
+    /// a gate that is technically failing and practically unreadable. 10,000%
+    /// is far past any tolerance anyone would set, so clamping loses no signal.
+    public static let maximumReportedUnderPredictionPercent = 10_000
+
+    /// Under-prediction as a percentage of what was reserved, clamped. Zero
+    /// when the model over-predicted.
     public var underPredictionPercent: Int {
         guard underPredicted else { return 0 }
-        return (observedPeak - reservedPeak).percent(of: reservedPeak)
+        let raw = (observedPeak - reservedPeak).percent(of: reservedPeak)
+        return Swift.min(AuditSample.maximumReportedUnderPredictionPercent, raw)
     }
 }
 

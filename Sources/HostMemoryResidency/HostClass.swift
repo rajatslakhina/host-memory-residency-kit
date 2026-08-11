@@ -159,6 +159,19 @@ public struct PressurePolicy: Sendable, Hashable, Codable {
         self.criticalRevocationPercent = Swift.min(100, Swift.max(0, criticalRevocationPercent))
     }
 
+    /// Decoding routes through the clamping initialiser.
+    ///
+    /// This is the whole point of the clamp: the realistic way a 400% policy
+    /// reaches this type is a mis-published remote config, and synthesized
+    /// `Decodable` would let it straight past.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            warningRevocationPercent: try container.decode(Int.self, forKey: .warningRevocationPercent),
+            criticalRevocationPercent: try container.decode(Int.self, forKey: .criticalRevocationPercent)
+        )
+    }
+
     func revokedHeadroomPercent(for level: MemoryPressureLevel) -> Int {
         switch level {
         case .normal: return 0
@@ -209,6 +222,24 @@ public struct HostBudgetTable: Sendable, Hashable, Codable {
     }
 
     public var isEmpty: Bool { entries.isEmpty }
+
+    private enum CodingKeys: String, CodingKey { case entries }
+
+    /// Decoding recomputes the floor rather than trusting the payload.
+    ///
+    /// `floor` is a stored property, so synthesized `Decodable` would accept a
+    /// supplied one — letting a crafted config hand a table of 24 MB extension
+    /// budgets a 4 GB fallback and defeating the fail-closed design in exactly
+    /// the remote-config scenario it was written for.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(entries: try container.decode([HostClass: HostBudget].self, forKey: .entries))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(entries, forKey: .entries)
+    }
 
     /// A worked example sized to the orders of magnitude iOS actually enforces:
     /// an app process measured in gigabytes, widget and notification

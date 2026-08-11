@@ -49,7 +49,11 @@ public struct MachFootprintProbe: FootprintProbe {
                 task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rebound, &count)
             }
         }
-        guard status == KERN_SUCCESS else { return .zero }
+        // Fail closed. Returning `.zero` would make "the probe failed" and
+        // "this process is using nothing" indistinguishable, and the second
+        // reading admits work the first should have refused. `.max` guarantees
+        // every subsequent admission is declined until the probe recovers.
+        guard status == KERN_SUCCESS else { return .max }
         // `Int(clamping:)` rather than `Int(_:)`: phys_footprint is a UInt64 and
         // the plain initialiser traps on a value above Int.max.
         return ByteCount(rawValue: Int(clamping: info.phys_footprint))
@@ -101,7 +105,19 @@ public struct ReservationLedger: Sendable {
     /// report, and deliberately not reset by `release`.
     public private(set) var highWaterMark: ByteCount = .zero
 
-    public init() {}
+    /// Hard cap on live reservations.
+    ///
+    /// Not decoration. A zero-byte reservation always satisfies the ceiling
+    /// check, and zero-byte deltas are the *normal* case once components are
+    /// already resident — so a caller that admits per timeline refresh and
+    /// forgets to `complete` would grow this dictionary without bound. An
+    /// unbounded collection inside a memory-budget library is the joke writing
+    /// itself, so the cap is enforced rather than documented.
+    public let maximumOutstandingReservations: Int
+
+    public init(maximumOutstandingReservations: Int = 64) {
+        self.maximumOutstandingReservations = Swift.max(1, maximumOutstandingReservations)
+    }
 
     /// Bytes claimed by reservations that have not been released.
     public var outstandingBytes: ByteCount {
@@ -120,6 +136,7 @@ public struct ReservationLedger: Sendable {
     /// No `await` appears anywhere in this method. That is the invariant the
     /// type exists to hold.
     public mutating func reserve(peak: ByteCount, ceiling: ByteCount) -> Reservation? {
+        guard outstanding.count < maximumOutstandingReservations else { return nil }
         let projected = measuredBaseline + outstandingBytes + peak
         guard projected <= ceiling else { return nil }
 

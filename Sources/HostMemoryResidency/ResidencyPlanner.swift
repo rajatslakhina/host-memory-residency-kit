@@ -30,6 +30,24 @@ public struct ResidencySelection: Sendable, Hashable, Identifiable {
     /// `true` when the component is already resident at this exact fidelity and
     /// therefore pays no activation cost in this plan.
     public let alreadyResident: Bool
+
+    /// Public so a consumer can build a synthetic plan and unit-test their own
+    /// code against this library without reaching for a real catalog.
+    public init(
+        id: ComponentID,
+        fidelity: Fidelity,
+        residentBytes: ByteCount,
+        activationPeakBytes: ByteCount,
+        meaningPreserved: Bool,
+        alreadyResident: Bool
+    ) {
+        self.id = id
+        self.fidelity = fidelity
+        self.residentBytes = residentBytes
+        self.activationPeakBytes = activationPeakBytes
+        self.meaningPreserved = meaningPreserved
+        self.alreadyResident = alreadyResident
+    }
 }
 
 /// A component the plan gives back.
@@ -38,6 +56,25 @@ public struct EvictionDecision: Sendable, Hashable, Identifiable {
     public let residentBytes: ByteCount
     public let teardownPeakBytes: ByteCount
     public let netReclaim: ByteCount
+    /// Relative cost of bringing this component back. Evictions are ordered by
+    /// bytes reclaimed per unit of rebuild cost, so the cheapest-to-rebuild wins
+    /// go first and a caller that has to stop early has already banked the best
+    /// of them.
+    public let rebuildCost: Int
+
+    public init(
+        id: ComponentID,
+        residentBytes: ByteCount,
+        teardownPeakBytes: ByteCount,
+        netReclaim: ByteCount,
+        rebuildCost: Int
+    ) {
+        self.id = id
+        self.residentBytes = residentBytes
+        self.teardownPeakBytes = teardownPeakBytes
+        self.netReclaim = netReclaim
+        self.rebuildCost = Swift.max(1, rebuildCost)
+    }
 }
 
 /// A component the plan *wanted* to evict and could not, because tearing it
@@ -46,6 +83,12 @@ public struct RetainedComponent: Sendable, Hashable, Identifiable {
     public let id: ComponentID
     public let residentBytes: ByteCount
     public let teardownPeakBytes: ByteCount
+
+    public init(id: ComponentID, residentBytes: ByteCount, teardownPeakBytes: ByteCount) {
+        self.id = id
+        self.residentBytes = residentBytes
+        self.teardownPeakBytes = teardownPeakBytes
+    }
 }
 
 /// A declared, auditable change of meaning.
@@ -55,6 +98,13 @@ public struct DegradationRecord: Sendable, Hashable, Identifiable {
     public let from: Fidelity
     public let to: Fidelity
     public let meaningFloor: Fidelity
+
+    public init(component: ComponentID, from: Fidelity, to: Fidelity, meaningFloor: Fidelity) {
+        self.component = component
+        self.from = from
+        self.to = to
+        self.meaningFloor = meaningFloor
+    }
 }
 
 /// The output of planning: what may be resident, at what fidelity, and what
@@ -73,9 +123,36 @@ public struct ResidencyPlan: Sendable, Hashable {
     /// Bytes held once everything has settled.
     public let steadyStateBytes: ByteCount
     /// Bytes that must be available at the worst instant of executing this
-    /// plan. This, not `steadyStateBytes`, is what gets reserved.
+    /// plan — the larger of the teardown phase and the activation phase. This,
+    /// not `steadyStateBytes`, is what gets reserved.
     public let reservedPeakBytes: ByteCount
     public let headroomBytes: ByteCount
+
+    public init(
+        host: HostClass,
+        purpose: HostPurpose,
+        pressure: MemoryPressureLevel,
+        activationModel: ActivationModel,
+        selections: [ResidencySelection],
+        evictions: [EvictionDecision],
+        retained: [RetainedComponent],
+        degradations: [DegradationRecord],
+        steadyStateBytes: ByteCount,
+        reservedPeakBytes: ByteCount,
+        headroomBytes: ByteCount
+    ) {
+        self.host = host
+        self.purpose = purpose
+        self.pressure = pressure
+        self.activationModel = activationModel
+        self.selections = selections
+        self.evictions = evictions
+        self.retained = retained
+        self.degradations = degradations
+        self.steadyStateBytes = steadyStateBytes
+        self.reservedPeakBytes = reservedPeakBytes
+        self.headroomBytes = headroomBytes
+    }
 
     /// Fraction of headroom the peak consumes, in percent, computed without
     /// dividing by a possibly-zero headroom.
@@ -177,10 +254,15 @@ public struct ResidencyPlanner: Sendable {
         // any ladder work — is both cheaper and easier to reason about than
         // re-checking it at every step.
         let allResidentBytes = ByteCount.sum(resident.map(\.residentBytes))
-        // Only genuinely evictable components contribute a teardown buffer. A
-        // net-negative one is never torn down, so charging its teardown peak
-        // here would refuse plans over a cost that will never be paid.
-        let evictable = resident.filter { !candidateIDs.contains($0.id) && $0.evictionIsNetPositive }
+        // Every net-positive resident component is a *possible* eviction: a
+        // component that is a candidate for this purpose can still be laddered
+        // to `.absent` and torn down. Bounding over all of them rather than only
+        // over non-candidates is deliberately conservative — the alternative
+        // under-charges the peak, which is the one direction this library
+        // treats as unacceptable. Net-negative ones are never torn down, so
+        // charging their teardown buffer would refuse plans over a cost that
+        // will never be paid.
+        let evictable = resident.filter(\.evictionIsNetPositive)
         let teardownTerm = transientTerm(
             evictable.map(\.teardownPeakBytes),
             model: activationModel
@@ -266,6 +348,7 @@ public struct ResidencyPlanner: Sendable {
             residentByID: residentByID,
             candidateIDs: candidateIDs,
             cost: current,
+            teardownPhasePeak: teardownPeak,
             headroom: headroom
         )
     }
@@ -452,6 +535,7 @@ public struct ResidencyPlanner: Sendable {
         residentByID: [ComponentID: ResidentComponent],
         candidateIDs: Set<ComponentID>,
         cost: Cost,
+        teardownPhasePeak: ByteCount,
         headroom: ByteCount
     ) -> ResidencyPlan {
 
@@ -498,7 +582,8 @@ public struct ResidencyPlanner: Sendable {
                         id: component.id,
                         residentBytes: component.residentBytes,
                         teardownPeakBytes: component.teardownPeakBytes,
-                        netReclaim: component.netReclaim
+                        netReclaim: component.netReclaim,
+                        rebuildCost: component.rebuildCost
                     )
                 )
             } else {
@@ -518,11 +603,28 @@ public struct ResidencyPlanner: Sendable {
             pressure: pressure,
             activationModel: activationModel,
             selections: selections.sorted { $0.id < $1.id },
-            evictions: evictions.sorted { $0.id < $1.id },
+            // Best benefit first: bytes reclaimed per unit of rebuild cost,
+            // tie-broken on id so the order is reproducible.
+            evictions: evictions.sorted { lhs, rhs in
+                if ByteCount.ratioIsGreater(
+                    value: lhs.netReclaim, weight: lhs.rebuildCost,
+                    than: rhs.netReclaim, weight: rhs.rebuildCost
+                ) { return true }
+                if ByteCount.ratioIsGreater(
+                    value: rhs.netReclaim, weight: rhs.rebuildCost,
+                    than: lhs.netReclaim, weight: lhs.rebuildCost
+                ) { return false }
+                return lhs.id < rhs.id
+            },
             retained: retained.sorted { $0.id < $1.id },
             degradations: degradations.sorted { $0.component < $1.component },
             steadyStateBytes: cost.steady,
-            reservedPeakBytes: cost.peak,
+            // The worst instant of executing this plan is whichever phase peaks
+            // higher. Reserving only the activation phase would under-charge
+            // every plan that tears something down first.
+            reservedPeakBytes: evictions.isEmpty
+                ? cost.peak
+                : ByteCount.maximum(cost.peak, teardownPhasePeak),
             headroomBytes: headroom
         )
     }

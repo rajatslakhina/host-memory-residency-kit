@@ -4,6 +4,11 @@ import Foundation
 public struct AdmittedResidency: Sendable, Hashable {
     public let plan: ResidencyPlan
     public let reservation: ReservationLedger.Reservation
+
+    public init(plan: ResidencyPlan, reservation: ReservationLedger.Reservation) {
+        self.plan = plan
+        self.reservation = reservation
+    }
 }
 
 /// What happened when pressure arrived.
@@ -39,7 +44,7 @@ public actor ResidencyCoordinator {
     private let catalog: ComponentCatalog
     private let probe: any FootprintProbe
 
-    private var ledger = ReservationLedger()
+    private var ledger: ReservationLedger
     private var resident: [ComponentID: ResidentComponent] = [:]
     private var audit: BudgetAudit
     private var pressure: MemoryPressureLevel = .normal
@@ -48,12 +53,16 @@ public actor ResidencyCoordinator {
         planner: ResidencyPlanner,
         catalog: ComponentCatalog,
         probe: any FootprintProbe,
-        auditCapacity: Int = 64
+        auditCapacity: Int = 64,
+        maximumOutstandingReservations: Int = 64
     ) {
         self.planner = planner
         self.catalog = catalog
         self.probe = probe
         self.audit = BudgetAudit(capacity: auditCapacity)
+        self.ledger = ReservationLedger(
+            maximumOutstandingReservations: maximumOutstandingReservations
+        )
     }
 
     // MARK: - Introspection
@@ -124,6 +133,7 @@ public actor ResidencyCoordinator {
         }
 
         apply(plan)
+        lastAppliedEpoch = reservation.epoch
         return .success(AdmittedResidency(plan: plan, reservation: reservation))
     }
 
@@ -135,6 +145,11 @@ public actor ResidencyCoordinator {
     /// budget layer slowly convinces itself it has no room left.
     @discardableResult
     public func complete(_ admitted: AdmittedResidency, observedPeak: ByteCount) -> Bool {
+        // Release first, and only record if the reservation was genuinely live.
+        // Recording unconditionally would file an audit sample for work that
+        // `reset()` already cancelled, quietly polluting the gate with a
+        // measurement of something that never finished.
+        guard ledger.release(admitted.reservation) else { return false }
         audit.record(
             AuditSample(
                 host: admitted.plan.host,
@@ -144,17 +159,30 @@ public actor ResidencyCoordinator {
                 observedPeak: observedPeak
             )
         )
-        return ledger.release(admitted.reservation)
+        return true
     }
 
-    /// Abandons a plan without recording an audit sample — the activation never
-    /// finished, so there is no honest peak to compare against.
+    /// Abandons a plan that never finished activating. No audit sample is
+    /// recorded, because there is no honest peak to compare against.
+    ///
+    /// Residency is only rolled back when this admission is still the most
+    /// recent one applied. Under concurrent admission, admission #1 sees
+    /// `alreadyResident == false` for everything and #2 sees `true`; rolling #1
+    /// back after #2 landed would delete components #2 is relying on while #2's
+    /// reservation stays live — the same lost-update family as the bug the
+    /// suspension-point ordering exists to prevent. When the plan has been
+    /// superseded the reservation is still released and `false` is returned, so
+    /// the caller can tell that nothing was undone.
     @discardableResult
     public func abandon(_ admitted: AdmittedResidency) -> Bool {
+        let released = ledger.release(admitted.reservation)
+        guard admitted.reservation.epoch == lastAppliedEpoch else { return false }
+
         for selection in admitted.plan.selections where !selection.alreadyResident {
             resident.removeValue(forKey: selection.id)
         }
-        return ledger.release(admitted.reservation)
+        lastAppliedEpoch = nil
+        return released
     }
 
     // MARK: - Pressure
@@ -213,12 +241,16 @@ public actor ResidencyCoordinator {
         pressure = .normal
         lastHost = nil
         lastPurpose = nil
+        lastAppliedEpoch = nil
     }
 
     // MARK: - Applying a plan
 
     private var lastHost: HostClass?
     private var lastPurpose: HostPurpose?
+    /// Epoch of the most recently applied admission, so `abandon` can tell a
+    /// live plan from a superseded one.
+    private var lastAppliedEpoch: UInt64?
 
     private var inferredHost: HostClass? { lastHost }
     private var inferredPurpose: HostPurpose? { lastPurpose }

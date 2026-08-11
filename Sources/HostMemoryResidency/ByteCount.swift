@@ -72,6 +72,23 @@ public struct ByteCount: Sendable, Hashable, Comparable, Codable {
         }
     }
 
+    /// Decoding routes through the clamping initialiser.
+    ///
+    /// Synthesized `Decodable` would assign `rawValue` directly and hand back a
+    /// negative `ByteCount` for `{"rawValue": -1}` — quietly falsifying the
+    /// "always in `0 ... Int.max`" invariant everything downstream relies on.
+    /// A budget arriving from a remote config is exactly the input this type
+    /// exists to survive.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        self.init(rawValue: try container.decode(Int.self))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
     public static func < (lhs: ByteCount, rhs: ByteCount) -> Bool {
         lhs.rawValue < rhs.rawValue
     }
@@ -162,9 +179,9 @@ public struct ByteCount: Sendable, Hashable, Comparable, Codable {
     /// without dividing, so a zero weight cannot trap and integer truncation
     /// cannot make two different ratios compare equal.
     ///
-    /// Weights are clamped to at least 1 by the caller's type invariants; the
-    /// clamp is repeated here because this is a static helper reachable from
-    /// anywhere in the module.
+    /// Used to order evictions by bytes reclaimed per unit of rebuild cost.
+    /// Weights are clamped to at least 1 here as well as at the call site,
+    /// because this is reachable from anywhere in the module.
     static func ratioIsGreater(
         value lhsValue: ByteCount, weight lhsWeight: Int,
         than rhsValue: ByteCount, weight rhsWeight: Int

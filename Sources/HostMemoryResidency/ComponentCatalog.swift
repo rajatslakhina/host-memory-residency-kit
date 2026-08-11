@@ -115,8 +115,71 @@ public struct ComponentDescriptor: Sendable, Hashable, Codable, Identifiable {
         self.profiles = profiles
     }
 
+    /// Decoding enforces the same invariants as construction.
+    ///
+    /// Synthesized `Decodable` on a public type is a second, unvalidated
+    /// constructor. Without this, `{"profiles": []}` mints a descriptor whose
+    /// documented invariants are all false.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let declaration = ComponentDeclaration(
+            id: try container.decode(ComponentID.self, forKey: .id),
+            requirement: try container.decode(ComponentRequirement.self, forKey: .requirement),
+            purposes: try container.decode(Set<HostPurpose>.self, forKey: .purposes),
+            meaningFloor: try container.decode(Fidelity.self, forKey: .meaningFloor),
+            profiles: try container.decode([FidelityProfile].self, forKey: .profiles)
+        )
+        self = try ComponentDescriptor.validated(declaration)
+    }
+
+    /// The single validating constructor. Every path that produces a
+    /// `ComponentDescriptor` — the catalog and `Decodable` alike — goes through
+    /// here, which is what lets the planner treat the invariants as facts.
+    static func validated(_ declaration: ComponentDeclaration) throws -> ComponentDescriptor {
+        let id = declaration.id
+        guard !declaration.profiles.isEmpty else { throw CatalogError.componentHasNoProfiles(id) }
+
+        var seen: Set<Fidelity> = []
+        for profile in declaration.profiles {
+            guard profile.fidelity != .absent else { throw CatalogError.absentFidelityDeclared(id) }
+            guard seen.insert(profile.fidelity).inserted else {
+                throw CatalogError.duplicateFidelity(id, profile.fidelity)
+            }
+        }
+
+        // Highest fidelity first. Sorting here means nothing downstream has to
+        // care what order a feature team wrote them in.
+        let sorted = declaration.profiles.sorted { $0.fidelity > $1.fidelity }
+
+        // Both curves must be monotonic. `residentBytes` monotonicity is what
+        // makes each ladder step reduce steady state; `activationCeiling`
+        // monotonicity is what stops a step down from *raising* the peak, which
+        // is the quantity the ladder's exit condition actually tests.
+        for (higher, lower) in zip(sorted, sorted.dropFirst()) {
+            if lower.residentBytes >= higher.residentBytes || lower.activationCeiling >= higher.activationCeiling {
+                throw CatalogError.nonMonotonicCost(id, lower: lower.fidelity, higher: higher.fidelity)
+            }
+        }
+
+        guard seen.contains(declaration.meaningFloor) else {
+            throw CatalogError.meaningFloorNotDeclared(id, declaration.meaningFloor)
+        }
+
+        return ComponentDescriptor(
+            id: id,
+            requirement: declaration.requirement,
+            purposes: declaration.purposes,
+            meaningFloor: declaration.meaningFloor,
+            profiles: sorted
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, requirement, purposes, meaningFloor, profiles
+    }
+
     /// The most expensive declared profile. Non-optional by construction:
-    /// `ComponentCatalog` rejects a component with no profiles, so this is the
+    /// every constructor rejects a component with no profiles, so this is the
     /// one place in the module where a first-element access is provably safe.
     public var richestProfile: FidelityProfile {
         // Safe: `profiles` is validated non-empty by `ComponentCatalog.init`,
@@ -176,7 +239,7 @@ public enum CatalogError: Error, Sendable, Hashable, CustomStringConvertible {
         case .absentFidelityDeclared(let id):
             return "component '\(id)' declares an '.absent' profile; absence is modelled by omission"
         case .nonMonotonicCost(let id, let lower, let higher):
-            return "component '\(id)': fidelity '\(lower.label)' does not cost less than '\(higher.label)'"
+            return "component '\(id)': fidelity '\(lower.label)' does not cost strictly less than '\(higher.label)' in both resident bytes and activation ceiling"
         case .meaningFloorNotDeclared(let id, let f):
             return "component '\(id)' names meaning floor '\(f.label)' but declares no such profile"
         }
@@ -199,35 +262,7 @@ public struct ComponentCatalog: Sendable, Hashable {
         for declaration in declarations {
             let id = declaration.id
             guard index[id] == nil else { throw CatalogError.duplicateComponent(id) }
-            guard !declaration.profiles.isEmpty else { throw CatalogError.componentHasNoProfiles(id) }
-
-            var seen: Set<Fidelity> = []
-            for profile in declaration.profiles {
-                guard profile.fidelity != .absent else { throw CatalogError.absentFidelityDeclared(id) }
-                guard seen.insert(profile.fidelity).inserted else {
-                    throw CatalogError.duplicateFidelity(id, profile.fidelity)
-                }
-            }
-
-            // Highest fidelity first. Sorting here means the planner never has
-            // to care what order a feature team wrote them in.
-            let sorted = declaration.profiles.sorted { $0.fidelity > $1.fidelity }
-
-            for (higher, lower) in zip(sorted, sorted.dropFirst()) where lower.residentBytes >= higher.residentBytes {
-                throw CatalogError.nonMonotonicCost(id, lower: lower.fidelity, higher: higher.fidelity)
-            }
-
-            guard seen.contains(declaration.meaningFloor) else {
-                throw CatalogError.meaningFloorNotDeclared(id, declaration.meaningFloor)
-            }
-
-            let descriptor = ComponentDescriptor(
-                id: id,
-                requirement: declaration.requirement,
-                purposes: declaration.purposes,
-                meaningFloor: declaration.meaningFloor,
-                profiles: sorted
-            )
+            let descriptor = try ComponentDescriptor.validated(declaration)
             index[id] = descriptor
             built.append(descriptor)
         }
